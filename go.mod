@@ -1,4 +1,4 @@
-module github.com/condrove10/dukascopy-downloader
+module github.com/condrove10/dukascopy-go
 
 go 1.23.0
 

@@ -3,133 +3,164 @@ package downloader
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
-	"github.com/condrove10/dukascopy-downloader/conversions"
-	"github.com/condrove10/dukascopy-downloader/csvencoder"
-	"github.com/condrove10/dukascopy-downloader/cursor"
-	"github.com/condrove10/dukascopy-downloader/internal/parser"
-	"github.com/condrove10/dukascopy-downloader/internal/timeformat"
-	"github.com/condrove10/dukascopy-downloader/retryablehttp"
-	"github.com/condrove10/dukascopy-downloader/tick"
-	"github.com/go-playground/validator/v10"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/condrove10/dukascopy-go/backoffpolicy"
+	"github.com/condrove10/dukascopy-go/channelmanager"
+	"github.com/condrove10/dukascopy-go/conversions"
+	"github.com/condrove10/dukascopy-go/csvencoder"
+	"github.com/condrove10/dukascopy-go/internal/parser"
+	"github.com/condrove10/dukascopy-go/retryablehttp"
+	"github.com/go-playground/validator/v10"
 )
 
 const urlTemplate = "https://datafeed.dukascopy.com/datafeed/%s/%04d/%02d/%02d/%02dh_ticks.bi5"
 
+var headers = map[string]string{
+	"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+	"Accept":          "*/*",
+	"Connection":      "keep-alive",
+	"Origin":          "https://freeserv.dukascopy.com",
+	"Referer":         "https://freeserv.dukascopy.com",
+	"Accept-Encoding": "gzip, deflate",
+	"Cache-Control":   "no-cache",
+}
+
 type Downloader struct {
-	Symbol      string       `validate:"required,min=3"`
-	StartTime   time.Time    `validate:"required"`
-	EndTime     time.Time    `validate:"required"`
-	Concurrency int          `validate:"required,gt=0"`
-	HttpClient  *http.Client `validate:"required"`
-}
-
-var DefaultDownloader = &Downloader{
-	Concurrency: 1,
-	HttpClient:  http.DefaultClient,
-}
-
-func (d *Downloader) WithSymbol(symbol string) *Downloader {
-	d.Symbol = symbol
-	return d
-}
-
-func (d *Downloader) WithStartTime(startTime time.Time) *Downloader {
-	d.StartTime = startTime
-	return d
-}
-
-func (d *Downloader) WithEndTime(endTime time.Time) *Downloader {
-	d.EndTime = endTime
-	return d
+	concurrency int          `validate:"required,gt=0"`
+	httpClient  *http.Client `validate:"required"`
+	bufferSize  int          `validate:"required,gt=0"`
 }
 
 func (d *Downloader) WithConcurrency(concurrency int) *Downloader {
-	d.Concurrency = concurrency
+	d.concurrency = concurrency
 	return d
 }
 
 func (d *Downloader) WithHttpClient(httpClient *http.Client) *Downloader {
-	d.HttpClient = httpClient
+	d.httpClient = httpClient
 	return d
 }
 
-func (d *Downloader) Download() ([]*tick.Tick, error) {
-	// Use context background to allow data to be flushed from the channels regardless
-	ctx := context.Background()
-	ticks := []*tick.Tick{}
+func (d *Downloader) WithBufferSize(bufferSize int) *Downloader {
+	d.bufferSize = bufferSize
+	return d
+}
 
-	c, err := d.Stream(1)
+var DefaultDownloader = &Downloader{
+	concurrency: 1,
+	httpClient:  http.DefaultClient,
+	bufferSize:  10000,
+}
+
+func (d *Downloader) Download(symbol string, start, end time.Time) ([]*parser.Tick, error) {
+	// Use context background to allow data to be flushed from the channels regardless
+	ticks := []*parser.Tick{}
+
+	m, err := d.Stream(symbol, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("failed to intialize stream: %w", err)
 	}
 
-	for {
-		if next := c.Next(ctx); !next {
-			break
-		}
+	if err := m.Process(func(data *parser.Tick) error {
+		ticks = append(ticks, data)
 
-		ticks = append(ticks, c.Read())
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to consume ticks: %w", err)
 	}
 
 	return ticks, nil
 }
 
-func (d *Downloader) Stream(bufferSize int) (*cursor.Cursor, error) {
-	streamChan := make(chan *tick.Tick, bufferSize)
-	errorChan := make(chan error, 1)
+func (d *Downloader) Stream(symbol string, start, end time.Time) (*channelmanager.ChannelManager[*parser.Tick], error) {
+	symbol = strings.ToUpper(symbol)
+
 	if err := validator.New().Struct(d); err != nil {
 		return nil, fmt.Errorf("failed to validate downloader instance: %w", err)
 	}
 
-	if d.EndTime.Before(d.StartTime) {
+	if end.Before(start) {
 		return nil, fmt.Errorf("end time must be after start time")
 	}
 
-	dates := timeformat.GetDateTimeRange(d.StartTime, d.EndTime, 1)
-	concurrencyChan := make(chan struct{}, d.Concurrency)
+	metadata, err := d.getInstrumentsMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch metadata: %w", err)
+	}
+
+	decimalFactor, err := getInstrumentDecimalFactor(metadata, symbol)
+	if err != nil {
+		return nil, fmt.Errorf("metadata not found: %w", err)
+	}
+
+	concurrencyChan := make(chan struct{}, d.concurrency)
 	var wg sync.WaitGroup
+	manager := channelmanager.NewChannelManager[*parser.Tick](d.bufferSize)
 
-	runConcurrentTask(func() error {
-		for _, date := range dates {
+	go func() {
+		for t := start.UTC().Truncate(time.Hour); t.Before(end.UTC().Truncate(time.Hour)) || t.Equal(end.UTC().Truncate(time.Hour)); t = t.Add(time.Hour) {
+			if t.Equal(end.UTC().Truncate(time.Hour)) && t.Equal(time.Now().UTC().Truncate(time.Hour)) {
+				continue
+			}
+
 			wg.Add(1)
+			concurrencyChan <- struct{}{}
 
-			runControlledTask(func() error {
-				defer wg.Done()
+			manager.Subscribe(func(c chan<- *parser.Tick) error {
+				defer func() {
+					wg.Done()
+					<-concurrencyChan
+				}()
 
-				batch, err := d.fetchTicksForDate(date)
+				batch, err := d.fetch(symbol, decimalFactor, t)
 				if err != nil {
-					return fmt.Errorf("failed to fetch ticks for date %s: %w", date, err)
+					return fmt.Errorf("failed to fetch batch: %w", err)
 				}
 
-				for _, t := range batch {
-					streamChan <- t
+				switch t {
+				case start.UTC().Truncate(time.Hour):
+					for _, v := range batch {
+						if v.Timestamp >= start.UTC().UnixNano() {
+							c <- v
+						}
+					}
+				case end.UTC().Truncate(time.Hour):
+					for _, v := range batch {
+						if v.Timestamp < end.UTC().UnixNano() {
+							c <- v
+						}
+					}
+				default:
+					for _, v := range batch {
+						c <- v
+					}
 				}
 
 				return nil
-			}, concurrencyChan, errorChan)
+			})
+
 		}
 
 		wg.Wait()
+		manager.Close()
+	}()
 
-		close(streamChan)
-
-		return nil
-	}, errorChan)
-
-	return cursor.NewCursor(streamChan, errorChan), nil
+	return manager, nil
 }
 
-func (d *Downloader) ToCsv(filePath string) error {
+func (d *Downloader) ToCsv(symbol string, start, end time.Time, filePath string) error {
 	ce := csvencoder.NewCSVEncoder()
 	ce.SetSeparator(';')
 
-	ticksSlice, err := d.Download()
+	ticksSlice, err := d.Download(symbol, start, end)
 	if err != nil {
 		return fmt.Errorf("failed to download ticks: %w", err)
 	}
@@ -158,50 +189,29 @@ func (d *Downloader) ToCsv(filePath string) error {
 	return nil
 }
 
-func runConcurrentTask(task func() error, errorChan chan error) {
-	go func() {
-		if err := task(); err != nil {
-			errorChan <- err
-		}
+func (d *Downloader) fetch(symbol string, decimalFactor float32, date time.Time) ([]*parser.Tick, error) {
+	url := fmt.Sprintf(urlTemplate, symbol, date.Year(), date.Month()-1, date.Day(), date.Hour())
 
-		close(errorChan)
-	}()
-}
+	client := retryablehttp.Client{
+		Context:       context.TODO(),
+		HttpClient:    d.httpClient,
+		RetryAttempts: 10,
+		RetryDelay:    time.Millisecond * 30,
+		RetryStrategy: backoffpolicy.StrategyExponential,
+		RetryPolicy: func(resp *http.Response, err error) error {
+			if err != nil {
+				return err
+			}
 
-func runControlledTask(task func() error, concurrencyChan chan struct{}, errorChan chan error) {
-	concurrencyChan <- struct{}{}
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("unexpected status code: %s", resp.Status)
+			}
 
-	go func() {
-		if err := task(); err != nil {
-			errorChan <- err
-		}
-		<-concurrencyChan
-	}()
-}
-
-func (d *Downloader) fetch(date time.Time) ([]byte, error) {
-	headers := map[string]string{
-		"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-		"Accept":          "/",
-		"Accept-Encoding": "gzip, deflate",
-		"Origin":          "https://freeserv.dukascopy.com",
-		"Connection":      "keep-alive",
-		"Referer":         "https://freeserv.dukascopy.com/",
-		"Cache-Control":   "no-cache",
+			return nil
+		},
 	}
 
-	url := fmt.Sprintf(urlTemplate, d.Symbol, date.Year(), date.Month()-1, date.Day(), date.Hour())
-
-	client := retryablehttp.DefaultClient.WithContext(context.Background()).WithUrl(url).WithHttpClient(d.HttpClient).WithMethod(retryablehttp.MethodGet).
-		WithMaxRetries(5).WithRetryDelay(time.Second * 15).WithHeader(headers).WithRetryCondition(func(resp *http.Response, err error) bool {
-		if err != nil || resp.StatusCode != http.StatusOK {
-			return true
-		}
-
-		return false
-	})
-
-	resp, err := client.Do()
+	resp, err := client.Get(url, headers)
 	if err != nil {
 		return nil, fmt.Errorf("error fetching data for url '%s': %w", url, err)
 	}
@@ -222,41 +232,82 @@ func (d *Downloader) fetch(date time.Time) ([]byte, error) {
 		return nil, fmt.Errorf("error reading data for url '%s': %w", url, err)
 	}
 
-	return content, nil
-}
-
-func (d *Downloader) fetchTicksForDate(date time.Time) ([]*tick.Tick, error) {
-	data, err := d.fetch(date.UTC())
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch data: %w", err)
-	}
-
-	parsedTicks, err := parser.Decode(data, d.Symbol, date)
+	parsedTicks, err := parser.Decode(content, symbol, decimalFactor, date)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse data: %w", err)
 	}
 
-	if time.Date(d.StartTime.Year(), d.StartTime.Month(), d.StartTime.Day(), d.StartTime.Hour(), 0, 0, 0, d.StartTime.Location()).Equal(date) {
-		tmp := []*tick.Tick{}
-		for _, t := range parsedTicks {
-			if time.Unix(0, t.Timestamp).After(d.StartTime) || time.Unix(0, t.Timestamp).Equal(d.StartTime) {
-				tmp = append(tmp, t)
-			}
-		}
-
-		return tmp, nil
-	}
-
-	if time.Date(d.EndTime.Year(), d.EndTime.Month(), d.EndTime.Day(), d.EndTime.Hour(), 0, 0, 0, d.EndTime.Location()).Equal(date) {
-		tmp := make([]*tick.Tick, 0)
-		for _, t := range parsedTicks {
-			if time.Unix(0, t.Timestamp).Before(d.EndTime) || time.Unix(0, t.Timestamp).Equal(d.EndTime) {
-				tmp = append(tmp, t)
-			}
-		}
-
-		return tmp, nil
-	}
-
 	return parsedTicks, nil
+}
+
+func (d *Downloader) getInstrumentsMetadata() (map[string]*parser.Metadata, error) {
+	url := "https://freeserv.dukascopy.com/2.0/index.php?path=common/instruments"
+
+	client := retryablehttp.Client{
+		Context:       context.TODO(),
+		HttpClient:    d.httpClient,
+		RetryAttempts: 10,
+		RetryDelay:    time.Millisecond * 30,
+		RetryStrategy: backoffpolicy.StrategyExponential,
+		RetryPolicy: func(resp *http.Response, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("unexpected status code: %s", resp.Status)
+			}
+
+			return nil
+		},
+	}
+
+	resp, err := client.Get(url, headers)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching data for url '%s': %w", url, err)
+	}
+	var reader io.ReadCloser
+	switch resp.Header.Get("Content-Encoding") {
+	case "gzip":
+		reader, err = gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("error creating gzip reader: %w", err)
+		}
+		defer reader.Close()
+	default:
+		reader = resp.Body
+	}
+
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("error reading data for url '%s': %w", url, err)
+	}
+
+	metadataResp := parser.MetadataResponse{}
+
+	if err := json.Unmarshal(content[6:len(content)-1], &metadataResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+	}
+
+	return metadataResp.Instruments, nil
+}
+
+func getInstrumentDecimalFactor(instruments map[string]*parser.Metadata, name string) (float32, error) {
+	// credits to Leo4815162342, commit 67c6903
+	switch name {
+	case "batusd":
+		return 100000, nil
+	case "uniusd":
+		return 1000, nil
+	case "lnkusd":
+		return 1000, nil
+	default:
+		for _, instrument := range instruments {
+			if strings.ToUpper(instrument.HistoricalFilename) == name {
+				return 10 / instrument.PipValue, nil
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("no match found for %s", name)
 }
