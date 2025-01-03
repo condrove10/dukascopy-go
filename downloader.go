@@ -17,6 +17,8 @@ import (
 	"github.com/condrove10/dukascopy-go/internal/conversions"
 	"github.com/condrove10/dukascopy-go/internal/csvencoder"
 	"github.com/condrove10/dukascopy-go/internal/parser"
+	"github.com/condrove10/dukascopy-go/metadata"
+	"github.com/condrove10/dukascopy-go/tick"
 	"github.com/condrove10/retryablehttp"
 	"github.com/condrove10/retryablehttp/backoffpolicy"
 	"github.com/go-playground/validator/v10"
@@ -61,19 +63,19 @@ var DefaultDownloader = &Downloader{
 	bufferSize:  10000,
 }
 
-func (d *Downloader) Download(symbol string, start, end time.Time) ([]*parser.Tick, error) {
-	ticks := []*parser.Tick{}
-	ticksMap := map[int64][]*parser.Tick{}
+func (d *Downloader) Download(symbol string, start, end time.Time) ([]*tick.Tick, error) {
+	ticks := []*tick.Tick{}
+	ticksMap := map[int64][]*tick.Tick{}
 
 	m, err := d.Stream(symbol, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("failed to intialize stream: %w", err)
 	}
 
-	if err := m.Process(func(data *parser.Tick) error {
+	if err := m.Process(func(data *tick.Tick) error {
 		timestampTrunc := conversions.TruncateTimestampToHour(data.Timestamp)
 		if _, ok := ticksMap[timestampTrunc]; !ok {
-			ticksMap[timestampTrunc] = []*parser.Tick{}
+			ticksMap[timestampTrunc] = []*tick.Tick{}
 		}
 		ticksMap[timestampTrunc] = append(ticksMap[timestampTrunc], data)
 
@@ -99,7 +101,7 @@ func (d *Downloader) Download(symbol string, start, end time.Time) ([]*parser.Ti
 	return ticks, nil
 }
 
-func (d *Downloader) Stream(symbol string, start, end time.Time) (*channelmanager.ChannelManager[*parser.Tick], error) {
+func (d *Downloader) Stream(symbol string, start, end time.Time) (*channelmanager.ChannelManager[*tick.Tick], error) {
 	symbol = strings.ToUpper(symbol)
 
 	if err := validator.New().Struct(d); err != nil {
@@ -122,7 +124,7 @@ func (d *Downloader) Stream(symbol string, start, end time.Time) (*channelmanage
 
 	concurrencyChan := make(chan struct{}, d.concurrency)
 	var wg sync.WaitGroup
-	manager := channelmanager.NewChannelManager[*parser.Tick](d.bufferSize)
+	manager := channelmanager.NewChannelManager[*tick.Tick](d.bufferSize)
 
 	go func() {
 		for t := start.UTC().Truncate(time.Hour); t.Before(end.UTC().Truncate(time.Hour)) || t.Equal(end.UTC().Truncate(time.Hour)); t = t.Add(time.Hour) {
@@ -133,7 +135,7 @@ func (d *Downloader) Stream(symbol string, start, end time.Time) (*channelmanage
 			wg.Add(1)
 			concurrencyChan <- struct{}{}
 
-			manager.Subscribe(func(c chan<- *parser.Tick) error {
+			manager.Subscribe(func(c chan<- *tick.Tick) error {
 				defer func() {
 					wg.Done()
 					<-concurrencyChan
@@ -208,7 +210,7 @@ func (d *Downloader) ToCsv(symbol string, start, end time.Time, filePath string)
 	return nil
 }
 
-func (d *Downloader) fetch(symbol string, decimalFactor float32, date time.Time) ([]*parser.Tick, error) {
+func (d *Downloader) fetch(symbol string, decimalFactor float32, date time.Time) ([]*tick.Tick, error) {
 	url := fmt.Sprintf(urlTemplate, symbol, date.Year(), date.Month()-1, date.Day(), date.Hour())
 
 	client := retryablehttp.Client{
@@ -259,7 +261,7 @@ func (d *Downloader) fetch(symbol string, decimalFactor float32, date time.Time)
 	return parsedTicks, nil
 }
 
-func (d *Downloader) getInstrumentsMetadata() (map[string]*parser.Metadata, error) {
+func (d *Downloader) getInstrumentsMetadata() (map[string]*metadata.Metadata, error) {
 	url := "https://freeserv.dukascopy.com/2.0/index.php?path=common/instruments"
 
 	client := retryablehttp.Client{
@@ -311,7 +313,7 @@ func (d *Downloader) getInstrumentsMetadata() (map[string]*parser.Metadata, erro
 	return metadataResp.Instruments, nil
 }
 
-func getInstrumentDecimalFactor(instruments map[string]*parser.Metadata, name string) (float32, error) {
+func getInstrumentDecimalFactor(instruments map[string]*metadata.Metadata, name string) (float32, error) {
 	// credits to Leo4815162342, commit 67c6903
 	switch name {
 	case "batusd":
