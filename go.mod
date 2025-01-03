@@ -1,9 +1,10 @@
 module github.com/condrove10/dukascopy-go
 
-go 1.23.0
+go 1.23.4
 
 require (
-	github.com/go-playground/validator/v10 v10.22.1
+	github.com/condrove10/retryablehttp v1.0.0
+	github.com/go-playground/validator/v10 v10.23.0
 	github.com/kjk/lzma v0.0.0-20161016003348-3fd93898850d
 )
 

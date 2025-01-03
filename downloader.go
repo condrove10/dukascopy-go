@@ -8,23 +8,24 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/condrove10/dukascopy-go/backoffpolicy"
-	"github.com/condrove10/dukascopy-go/channelmanager"
-	"github.com/condrove10/dukascopy-go/conversions"
-	"github.com/condrove10/dukascopy-go/csvencoder"
+	"github.com/condrove10/dukascopy-go/internal/channelmanager"
+	"github.com/condrove10/dukascopy-go/internal/conversions"
+	"github.com/condrove10/dukascopy-go/internal/csvencoder"
 	"github.com/condrove10/dukascopy-go/internal/parser"
-	"github.com/condrove10/dukascopy-go/retryablehttp"
+	"github.com/condrove10/retryablehttp"
+	"github.com/condrove10/retryablehttp/backoffpolicy"
 	"github.com/go-playground/validator/v10"
 )
 
 const urlTemplate = "https://datafeed.dukascopy.com/datafeed/%s/%04d/%02d/%02d/%02dh_ticks.bi5"
 
 var headers = map[string]string{
-	"User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+	"User-Agent":      "Dukascopy Go Project",
 	"Accept":          "*/*",
 	"Connection":      "keep-alive",
 	"Origin":          "https://freeserv.dukascopy.com",
@@ -61,8 +62,8 @@ var DefaultDownloader = &Downloader{
 }
 
 func (d *Downloader) Download(symbol string, start, end time.Time) ([]*parser.Tick, error) {
-	// Use context background to allow data to be flushed from the channels regardless
 	ticks := []*parser.Tick{}
+	ticksMap := map[int64][]*parser.Tick{}
 
 	m, err := d.Stream(symbol, start, end)
 	if err != nil {
@@ -70,11 +71,29 @@ func (d *Downloader) Download(symbol string, start, end time.Time) ([]*parser.Ti
 	}
 
 	if err := m.Process(func(data *parser.Tick) error {
-		ticks = append(ticks, data)
+		timestampTrunc := conversions.TruncateTimestampToHour(data.Timestamp)
+		if _, ok := ticksMap[timestampTrunc]; !ok {
+			ticksMap[timestampTrunc] = []*parser.Tick{}
+		}
+		ticksMap[timestampTrunc] = append(ticksMap[timestampTrunc], data)
 
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("failed to consume ticks: %w", err)
+	}
+
+	hours := []int64{}
+
+	for k := range ticksMap {
+		hours = append(hours, k)
+	}
+
+	sort.Slice(hours, func(i, j int) bool {
+		return hours[i] < hours[j]
+	})
+
+	for _, h := range hours {
+		ticks = append(ticks, ticksMap[h]...)
 	}
 
 	return ticks, nil

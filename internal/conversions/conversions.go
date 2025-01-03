@@ -106,3 +106,8 @@ func convertValue(value interface{}, tagName string) (interface{}, error) {
 		return value, nil
 	}
 }
+
+func TruncateTimestampToHour(unixNano int64) int64 {
+	const nanosecondsPerHour = 3600 * 1_000_000_000 // 3.6 trillion nanoseconds in an hour
+	return (unixNano / nanosecondsPerHour) * nanosecondsPerHour
+}
