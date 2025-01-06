@@ -249,6 +249,11 @@ func (d *Downloader) fetch(symbol string, decimalFactor float32, date time.Time)
 	if err != nil {
 		return nil, fmt.Errorf("error fetching data for url '%s': %w", url, err)
 	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return []*tick.Tick{}, nil
+	}
+
 	var reader io.ReadCloser
 	switch resp.Header.Get("Content-Encoding") {
 	case "gzip":
