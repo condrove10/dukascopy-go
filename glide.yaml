@@ -1,0 +1,3 @@
+package: github.com/condrove10/dukascopy-go
+import:
+  - package: github.com/kjk/lzma
