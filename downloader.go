@@ -250,7 +250,7 @@ func (d *Downloader) fetch(symbol string, decimalFactor float32, date time.Time)
 		return nil, fmt.Errorf("error fetching data for url '%s': %w", url, err)
 	}
 
-	if resp.StatusCode == http.StatusNotFound {
+	if resp.StatusCode != http.StatusOK {
 		return []*tick.Tick{}, nil
 	}
 
@@ -269,6 +269,10 @@ func (d *Downloader) fetch(symbol string, decimalFactor float32, date time.Time)
 	content, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("error reading data for url '%s': %w", url, err)
+	}
+
+	if len(content) == 0 {
+		return []*tick.Tick{}, nil
 	}
 
 	parsedTicks, err := parser.Decode(content, symbol, decimalFactor, date)
