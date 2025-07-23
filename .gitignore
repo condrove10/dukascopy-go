@@ -12,9 +12,6 @@
 # Idea IDE
 .idea/
 
-# CMD dir
-cmd/
-
 # Test binary, built with `go test -c`
 *.test
 
@@ -43,7 +40,6 @@ go.work
 
 # ---> Node
 # Logs
-log*
 *.log
 *.log*
 npm-debug.log*
@@ -125,6 +121,7 @@ web_modules/
 .env.local
 
 # parcel-bundler cache (https://parceljs.org/)
+.cache
 .parcel-cache
 
 # Next.js build output
@@ -173,4 +170,6 @@ dist
 .yarn/install-state.gz
 .pnp.*
 
-test*/
+**/test*
+**/log*
+!pkg/**
